@@ -165,6 +165,7 @@ struct WebView: UIViewRepresentable {
         config.userContentController.addUserScript(script)
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         webView.scrollView.bounces = true
         webView.scrollView.contentInsetAdjustmentBehavior = .always
@@ -178,9 +179,18 @@ struct WebView: UIViewRepresentable {
 
     func updateUIView(_ webView: WKWebView, context: Context) {}
 
-    class Coordinator: NSObject, WKNavigationDelegate {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let model: BrowserModel
         init(model: BrowserModel) { self.model = model }
+        // Links that open in a new window (target="_blank", e.g. search results
+        // and second-level pages) would otherwise do nothing: WKWebView has no
+        // second web view to hand them to. Load them in this same web view.
+        func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+            if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+                webView.load(URLRequest(url: url))
+            }
+            return nil
+        }
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // sign-in only on a real 52pojie page — never on a challenge or
             // error page
