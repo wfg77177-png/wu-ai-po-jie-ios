@@ -27,10 +27,7 @@ private let wjJS = """
   window.__wjTrySignIn = function(force){
     var today = new Date().toISOString().slice(0,10);
     if(!force && read('signDate','') === today) return;
-    fetch('/home.php?mod=task&do=apply&id=2', {method:'GET', credentials:'include'})
-      .then(function(){ store('signDate', today); })
-      .catch(function(){});
-    setTimeout(function(){
+    function clickSignInBtn(){
       var els = document.querySelectorAll('a, button, input, img');
       for(var i=0;i<els.length;i++){
         var el = els[i];
@@ -41,7 +38,10 @@ private let wjJS = """
           break;
         }
       }
-    }, 1500);
+    }
+    fetch('/home.php?mod=task&do=apply&id=2', {method:'GET', credentials:'include'})
+      .then(function(r){ if(r.ok){ store('signDate', today); } else { setTimeout(clickSignInBtn, 1500); } })
+      .catch(function(){ setTimeout(clickSignInBtn, 1500); });
   };
 
   // Section navigation (tap a section name in the native picker)
