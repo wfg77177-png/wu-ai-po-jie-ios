@@ -549,7 +549,7 @@ private let wjJS = """
     el.setAttribute('data-wj-code','1');
     var code=el.textContent||'';
     var esc=code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    var re=/("(?:[^"]*)"|'(?:[^']*)')|(\/\/.*)|([/][*][^]*?[*][/])|(^|[^A-Za-z0-9_])(function|var|let|const|if|else|for|while|return|class|import|export|from|new|try|catch|public|private|static|void|int|char|def|print|break|continue|switch|case|do|this|self|nil|null|true|false)(?![A-Za-z0-9_])|(^|[^A-Za-z0-9_])([0-9]+(?:[.][0-9]+)?)/g;
+    var re=/("(?:[^"]*)"|'(?:[^']*)')|(\\/\\/.*)|([/][*][^]*?[*][/])|(^|[^A-Za-z0-9_])(function|var|let|const|if|else|for|while|return|class|import|export|from|new|try|catch|public|private|static|void|int|char|def|print|break|continue|switch|case|do|this|self|nil|null|true|false)(?![A-Za-z0-9_])|(^|[^A-Za-z0-9_])([0-9]+(?:[.][0-9]+)?)/g;
     var html=esc.replace(re, function(m, str, lineCom, blkCom, kwPre, kw, numPre, num){
       if(str!==undefined) return '<span style="color:#a31515">'+m+'</span>';
       if(lineCom!==undefined) return '<span style="color:#6a9955">'+m+'</span>';
@@ -606,7 +606,7 @@ private let wjJS = """
   function wjTransCfg(){
     try{
       var c=JSON.parse(localStorage.getItem('wj_transCfg')||'{}');
-      return { key:(c.key||'').trim(), base:(c.base||'https://openrouter.ai/api/v1').replace(/\/+$/,''), model:(c.model||'deepseek/deepseek-chat').trim() };
+      return { key:(c.key||'').trim(), base:(c.base||'https://openrouter.ai/api/v1').replace(/\\/+$/,''), model:(c.model||'deepseek/deepseek-chat').trim() };
     }catch(e){ return { key:'', base:'https://openrouter.ai/api/v1', model:'deepseek/deepseek-chat' }; }
   }
   window.__wjSetTransCfg = function(json){ try{ localStorage.setItem('wj_transCfg', json); }catch(e){} };
