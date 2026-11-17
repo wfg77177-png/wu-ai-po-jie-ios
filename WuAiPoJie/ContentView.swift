@@ -1,5 +1,7 @@
 import SwiftUI
 import WebKit
+import Photos
+import AVFoundation
 
 // MARK: - JS #1: CSS only, injected at document start (kills white flash)
 // Only dark-mode CSS + ad-hiding CSS. Runs in main frame only.
@@ -19,6 +21,11 @@ private let wjCSSJS = """
       a.textContent = '[class*="ad-"],[id*="ad-"],[id^="ad_"],[class*="advert"],[class*="sponsor"],[class*="promo-banner"],[class*="a_pt"],[class*="a_mu"]{display:none !important;}';
       document.documentElement.appendChild(a);
     }
+    // suppress the native long-press callout on thread links so the
+    // long-press preview (JS #2 section 15) shows cleanly
+    var c = document.createElement('style'); c.id = 'wj-touch-style';
+    c.textContent = 'a[href*="thread-"]{-webkit-touch-callout:none;}';
+    document.documentElement.appendChild(c);
   }catch(e){}
 })();
 """
@@ -26,9 +33,12 @@ private let wjCSSJS = """
 // MARK: - JS #2: features, injected at document end, main frame only
 // Safe features only: sign-in (called from native after real load),
 // dark mode, hide ads, keyword filter, hide 悬赏/导读， fullscreen images,
-// remember scroll position, section navigation, back to top.
+// remember scroll position, section navigation, back to top,
+// infinite scroll, read markers, long-post folding, only-OP,
+// long-press preview, export helpers (Markdown / TTS text / images).
 // No auto-reply / auto-comment. localStorage holds only the sign-in date
-// guard and display settings — never any session, token or credential.
+// guard, display settings and the read-post list — never any session,
+// token or credential.
 private let wjJS = """
 (function(){
   function store(k,v){ try{ localStorage.setItem('wj_'+k, v); }catch(e){} }
@@ -186,10 +196,234 @@ private let wjJS = """
   // ---------- 9. Back to top ----------
   window.__wjTop = function(){ window.scrollTo({top:0, behavior:'smooth'}); };
 
-  // ---------- 10. Re-apply after a real load (called from native didFinish) ----------
+  // ---------- 11. Read markers (localStorage list of thread IDs only) ----------
+  function wjReadSet(){
+    try{ var a=JSON.parse(localStorage.getItem('wj_read')||'[]'); return Array.isArray(a)?a:[]; }catch(e){ return []; }
+  }
+  function wjThreadId(href){
+    if(!href) return null;
+    var p = href.split('thread-');
+    if(p.length < 2) return null;
+    var id = p[1].split('-')[0];
+    return (id !== '' && !isNaN(Number(id))) ? id : null;
+  }
+  function applyRead(){
+    var set = wjReadSet();
+    if(set.length===0) return;
+    var lookup = {};
+    set.forEach(function(id){ lookup[id]=true; });
+    document.querySelectorAll('a[href*="thread-"]').forEach(function(a){
+      var id = wjThreadId(a.getAttribute('href'));
+      if(id && lookup[id]){
+        var row = a.closest('li, article, div, tr');
+        if(row) row.style.opacity='0.45';
+      }
+    });
+  }
+  window.__wjClearRead = function(){
+    try{ localStorage.removeItem('wj_read'); }catch(e){}
+    document.querySelectorAll('a[href*="thread-"]').forEach(function(a){
+      var row = a.closest('li, article, div, tr');
+      if(row) row.style.opacity='';
+    });
+    showToast('已读记录已清空');
+  };
+  document.addEventListener('click', function(e){
+    var a = e.target.closest ? e.target.closest('a[href*="thread-"]') : null;
+    if(!a) return;
+    var id = wjThreadId(a.getAttribute('href'));
+    if(!id) return;
+    try{
+      var set = wjReadSet();
+      if(set.indexOf(id)===-1){ set.push(id); if(set.length>500) set=set.slice(-500); localStorage.setItem('wj_read', JSON.stringify(set)); }
+    }catch(err){}
+  }, true);
+  applyRead();
+  new MutationObserver(function(){ applyRead(); }).observe(document.documentElement, {childList:true, subtree:true});
+
+  // ---------- 12. Infinite scroll (Discuz list pages only, read-only fetch) ----------
+  var wjLoadingNext = false;
+  var wjNextUrl = null;
+  function wjFindNextUrl(doc){
+    var links = doc.querySelectorAll('.pg a, #fd_page_bottom a, .pgs a');
+    for(var i=0;i<links.length;i++){
+      var t=(links[i].textContent||'').trim();
+      if(t.indexOf('下一页')!==-1){ return links[i].getAttribute('href'); }
+    }
+    return null;
+  }
+  function wjAppendNextPage(){
+    if(wjLoadingNext) return;
+    if(!document.querySelector('#threadlist') && !document.querySelector('tbody[id^="normalthread_"]')) return;
+    if(!wjNextUrl) wjNextUrl = wjFindNextUrl(document);
+    if(!wjNextUrl) return;
+    wjLoadingNext = true;
+    fetch(wjNextUrl, {credentials:'include'}).then(function(r){ return r.text(); }).then(function(html){
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      var rows = doc.querySelectorAll('tbody[id^="normalthread_"]');
+      var table = document.querySelector('#threadlist table');
+      if(rows.length && table){
+        rows.forEach(function(r){ table.appendChild(document.importNode(r, true)); });
+      } else {
+        var seen = {};
+        doc.querySelectorAll('a[href*="thread-"]').forEach(function(a){
+          var row = a.closest('li, article, div, tr');
+          var href = a.getAttribute('href');
+          if(row && href && !seen[href]){
+            seen[href]=1;
+            var parent = document.querySelector('#threadlist') || document.body;
+            parent.appendChild(document.importNode(row, true));
+          }
+        });
+      }
+      wjNextUrl = wjFindNextUrl(doc);
+      applyRead(); applyKeywords(); foldLongPosts();
+      wjLoadingNext = false;
+    }).catch(function(){ wjLoadingNext = false; });
+  }
+  window.addEventListener('scroll', function(){
+    if(wjLoadingNext) return;
+    if(window.innerHeight + window.scrollY > document.body.scrollHeight - 600) wjAppendNextPage();
+  }, {passive:true});
+
+  // ---------- 13. Long-post folding (thread pages) ----------
+  function foldLongPosts(){
+    document.querySelectorAll('.t_f').forEach(function(el){
+      if(el.getAttribute('data-wj-folded')) return;
+      var txt = el.textContent || '';
+      if(txt.length < 1200) return;
+      el.setAttribute('data-wj-folded','1');
+      el.style.maxHeight='420px';
+      el.style.overflow='hidden';
+      var btn=document.createElement('button');
+      btn.textContent='展开全文';
+      btn.style.cssText='display:block;margin:8px 0;padding:6px 14px;border:1px solid #ccc;border-radius:16px;background:#f5f5f5;font-size:14px;';
+      btn.addEventListener('click', function(){
+        el.style.maxHeight='none'; el.style.overflow='visible'; btn.remove();
+      });
+      el.parentNode.insertBefore(btn, el.nextSibling);
+    });
+  }
+  foldLongPosts();
+
+  // ---------- 14. Only OP (thread pages) ----------
+  window.__wjOnlyOP = function(){
+    var links = document.querySelectorAll('a');
+    for(var i=0;i<links.length;i++){
+      var t=(links[i].textContent||'').trim();
+      if(t.indexOf('只看该作者')!==-1 || t.indexOf('只看楼主')!==-1){ links[i].click(); return true; }
+    }
+    showToast('本页没有“只看该作者”');
+    return false;
+  };
+
+  // ---------- 15. Long-press preview on list pages ----------
+  var wjPressTimer=null, wjPressTarget=null, wjPressMoved=false, wjSuppressClick=false;
+  function wjClosePreview(){ var c=document.getElementById('wj-preview-card'); if(c) c.remove(); }
+  function wjShowPreview(title, text){
+    wjClosePreview();
+    var card=document.createElement('div');
+    card.id='wj-preview-card';
+    card.style.cssText='position:fixed;left:12px;right:12px;top:18%;max-height:55%;overflow:auto;background:#fff;color:#111;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,0.35);padding:16px;z-index:999999;';
+    var h=document.createElement('div');
+    h.textContent=title; h.style.cssText='font-weight:bold;font-size:16px;margin-bottom:8px;';
+    var p=document.createElement('div');
+    p.textContent=text; p.style.cssText='font-size:14px;line-height:1.6;white-space:pre-wrap;';
+    var b=document.createElement('button');
+    b.textContent='关闭'; b.style.cssText='margin-top:12px;padding:6px 16px;border-radius:16px;border:1px solid #ccc;background:#f5f5f5;font-size:14px;';
+    b.addEventListener('click', wjClosePreview);
+    card.appendChild(h); card.appendChild(p); card.appendChild(b);
+    document.body.appendChild(card);
+  }
+  document.addEventListener('touchstart', function(e){
+    var a = e.target.closest ? e.target.closest('a[href*="thread-"]') : null;
+    if(!a) return;
+    wjPressTarget=a; wjPressMoved=false;
+    wjPressTimer=setTimeout(function(){
+      if(wjPressMoved || !wjPressTarget) return;
+      var href=wjPressTarget.getAttribute('href');
+      var title=(wjPressTarget.textContent||'').trim();
+      wjSuppressClick=true;
+      fetch(href, {credentials:'include'}).then(function(r){ return r.text(); }).then(function(html){
+        var doc=new DOMParser().parseFromString(html,'text/html');
+        var first=doc.querySelector('.t_f');
+        var text=first ? (first.textContent||'').trim().slice(0,400) : '（未能读取预览）';
+        wjShowPreview(title, text);
+      }).catch(function(){ wjShowPreview(title,'（预览加载失败）'); });
+    }, 550);
+  }, {passive:true});
+  document.addEventListener('touchmove', function(){ wjPressMoved=true; if(wjPressTimer){ clearTimeout(wjPressTimer); wjPressTimer=null; } }, {passive:true});
+  document.addEventListener('touchend', function(){ if(wjPressTimer){ clearTimeout(wjPressTimer); wjPressTimer=null; } }, {passive:true});
+  document.addEventListener('click', function(e){
+    if(wjSuppressClick){
+      var a = e.target.closest ? e.target.closest('a[href*="thread-"]') : null;
+      if(a){ e.preventDefault(); e.stopPropagation(); }
+      wjSuppressClick=false;
+    }
+    var card=document.getElementById('wj-preview-card');
+    if(card && !card.contains(e.target)) wjClosePreview();
+  }, true);
+
+  // ---------- 16. Export helpers (called from native; read-only) ----------
+  window.__wjExportMarkdown = function(){
+    try{
+      var titleEl = document.querySelector('#thread_subject') || document.querySelector('h1');
+      var title = titleEl ? (titleEl.textContent||'').trim() : document.title;
+      var posts = document.querySelectorAll('.t_f');
+      var lines = ['# ' + title, ''];
+      posts.forEach(function(p, idx){
+        var cell = p.closest('td.plc') || p.parentNode;
+        var author = '';
+        if(cell){
+          var a = cell.querySelector('.xw1') || cell.querySelector('.authi a');
+          if(a) author = (a.textContent||'').trim();
+        }
+        lines.push('## ' + (author || ('楼层 ' + (idx+1))));
+        lines.push('');
+        p.querySelectorAll('img').forEach(function(im){
+          var src = im.getAttribute('file') || im.getAttribute('src') || '';
+          if(src) lines.push('![](' + src + ')');
+        });
+        lines.push((p.textContent||'').trim());
+        lines.push('');
+      });
+      return lines.join(String.fromCharCode(10));
+    }catch(e){ return null; }
+  };
+  window.__wjThreadText = function(){
+    try{
+      var titleEl = document.querySelector('#thread_subject') || document.querySelector('h1');
+      var title = titleEl ? (titleEl.textContent||'').trim() : document.title;
+      var texts = [];
+      document.querySelectorAll('.t_f').forEach(function(p){
+        var t=(p.textContent||'').trim();
+        if(t) texts.push(t);
+      });
+      return (title + String.fromCharCode(10) + texts.join(String.fromCharCode(10))).slice(0, 20000);
+    }catch(e){ return ''; }
+  };
+  window.__wjCollectImages = function(){
+    try{
+      var urls = [];
+      document.querySelectorAll('.t_f img').forEach(function(im){
+        var src = im.getAttribute('file') || im.getAttribute('src') || '';
+        if(!src) return;
+        if(src.indexOf('http')!==0){
+          if(src.indexOf('/')===0) src = location.origin + src;
+          else src = location.href.replace(/[^/]*$/,'') + src;
+        }
+        if(urls.indexOf(src)===-1) urls.push(src);
+      });
+      return JSON.stringify(urls.slice(0, 50));
+    }catch(e){ return '[]'; }
+  };
+
+  // ---------- 17. Re-apply after a real load (called from native didFinish) ----------
   window.__wjReapply = function(){
     applyKeywords();
     applyHideReward();
+    applyRead();
+    foldLongPosts();
     try{
       var y=parseInt(sessionStorage.getItem('wj_pos_'+location.pathname)||'0',10);
       if(y>200){ setTimeout(function(){ window.scrollTo(0,y); }, 300); }
@@ -199,7 +433,7 @@ private let wjJS = """
 """
 
 // MARK: - Model
-final class BrowserModel: ObservableObject {
+final class BrowserModel: NSObject, ObservableObject, AVSpeechSynthesizerDelegate {
     weak var webView: WKWebView?
     @Published var isDark = false
     @Published var fontScale: CGFloat = 1.0
@@ -207,6 +441,13 @@ final class BrowserModel: ObservableObject {
     @Published var hideReward = false
     @Published var keywords = ""
     @Published var canGoBack = false
+    @Published var isSpeaking = false
+    private let speech = AVSpeechSynthesizer()
+
+    override init() {
+        super.init()
+        speech.delegate = self
+    }
 
     let homeURL = URL(string: "https://www.52pojie.cn/")!
     // Board names verified from the live site (2026-11-17); navigation is by
@@ -253,6 +494,109 @@ final class BrowserModel: ObservableObject {
     }
     func manualSignIn() {
         webView?.evaluateJavaScript("window.__wjTrySignIn && window.__wjTrySignIn(true); window.__wjToast && window.__wjToast('已尝试签到');", completionHandler: nil)
+    }
+    // --- v2 batch A: safe thread tools (read-only or user-triggered) ---
+    func onlyOP() {
+        webView?.evaluateJavaScript("window.__wjOnlyOP && window.__wjOnlyOP();", completionHandler: nil)
+    }
+    func clearReadHistory() {
+        webView?.evaluateJavaScript("window.__wjClearRead && window.__wjClearRead();", completionHandler: nil)
+    }
+    func exportMarkdown() {
+        webView?.evaluateJavaScript("window.__wjExportMarkdown && window.__wjExportMarkdown();") { result, _ in
+            guard let md = result as? String, !md.isEmpty else { return }
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("52pojie-thread.md")
+            try? md.write(to: url, atomically: true, encoding: .utf8)
+            Self.presentShare([url])
+        }
+    }
+    func exportPDF() {
+        guard let webView = webView else { return }
+        webView.createPDF { result in
+            switch result {
+            case .success(let data):
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("52pojie-thread.pdf")
+                try? data.write(to: url)
+                Self.presentShare([url])
+            case .failure:
+                break
+            }
+        }
+    }
+    func savePageImages() {
+        webView?.evaluateJavaScript("window.__wjCollectImages && window.__wjCollectImages();") { result, _ in
+            guard let json = result as? String,
+                  let data = json.data(using: .utf8),
+                  let urls = try? JSONDecoder().decode([String].self, from: data),
+                  !urls.isEmpty else {
+                self.webView?.evaluateJavaScript("window.__wjToast && window.__wjToast('本页没有可保存的图片');", completionHandler: nil)
+                return
+            }
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                guard status == .authorized || status == .limited else {
+                    DispatchQueue.main.async {
+                        self.webView?.evaluateJavaScript("window.__wjToast && window.__wjToast('请在设置中允许访问相册');", completionHandler: nil)
+                    }
+                    return
+                }
+                self.downloadAndSaveImages(urls)
+            }
+        }
+    }
+    private func downloadAndSaveImages(_ urls: [String]) {
+        DispatchQueue(label: "wj.saveImages").async {
+            var saved = 0
+            for u in urls {
+                guard let url = URL(string: u) else { continue }
+                let sem = DispatchSemaphore(value: 0)
+                URLSession.shared.dataTask(with: url) { data, _, _ in
+                    defer { sem.signal() }
+                    guard let data = data, let image = UIImage(data: data) else { return }
+                    do {
+                        try PHPhotoLibrary.shared().performChangesAndWait {
+                            PHAssetChangeRequest.creationRequestForAsset(from: image)
+                        }
+                        saved += 1
+                    } catch { }
+                }.resume()
+                sem.wait()
+            }
+            DispatchQueue.main.async {
+                self.webView?.evaluateJavaScript("window.__wjToast && window.__wjToast('已保存 \(saved) 张图片到相册');", completionHandler: nil)
+            }
+        }
+    }
+    func toggleSpeech() {
+        if isSpeaking {
+            speech.stopSpeaking(at: .immediate)
+            isSpeaking = false
+            return
+        }
+        webView?.evaluateJavaScript("window.__wjThreadText && window.__wjThreadText();") { result, _ in
+            guard let text = result as? String, !text.isEmpty else { return }
+            let utterance = AVSpeechUtterance(string: text)
+            utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
+            utterance.rate = 0.5
+            self.speech.speak(utterance)
+            self.isSpeaking = true
+        }
+    }
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        isSpeaking = false
+    }
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        isSpeaking = false
+    }
+    static func presentShare(_ items: [Any]) {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else { return }
+        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        if let pop = vc.popoverPresentationController {
+            pop.sourceView = root.view
+            pop.sourceRect = CGRect(x: root.view.bounds.midX, y: root.view.bounds.midY, width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        root.present(vc, animated: true)
     }
 }
 
@@ -357,6 +701,24 @@ struct BottomBar: View {
             }
             BarButton(icon: "arrow.up", label: "顶部") { model.backToTop() }
             BarButton(icon: "gearshape", label: "设置") { showSettings = true }
+            Menu {
+                Button("只看楼主") { model.onlyOP() }
+                Button("导出 Markdown") { model.exportMarkdown() }
+                Button("导出 PDF") { model.exportPDF() }
+                Button("保存本页图片") { model.savePageImages() }
+                Button(model.isSpeaking ? "停止朗读" : "朗读帖子") { model.toggleSpeech() }
+            } label: {
+                VStack(spacing: 3) {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 19, weight: .medium))
+                    Text("更多")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.primary)
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 6)
@@ -461,6 +823,12 @@ struct SettingsSheet: View {
                     TextField("多个关键词用英文逗号隔开", text: $keywordsText)
                         .onChange(of: keywordsText) { model.setKeywords($0) }
                     Text("包含这些词的帖子标题会被隐藏。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Section("已读记录") {
+                    Button("清空已读记录") { model.clearReadHistory() }
+                    Text("点过的帖子会变暗，方便区分。")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
